@@ -11,16 +11,13 @@ from transformer_tf import Transformer, CustomSchedule, create_masks
 from vocabulary import tokenization
 
 EPOCHS = 30
-BUFFER_SIZE = 20000
-BATCH_SIZE = 64
-MAX_LENGTH = 40
+# BATCH_SIZE = 64
+MAX_TOTAL_LENGTH = 25000
 num_layers = 4
-d_model = 128
+d_model = 512
 dff = 512
 num_heads = 8
 dropout_rate = 0.1
-input_vocab_size = (2 ** 13) + 2
-target_vocab_size = (2 ** 13) + 2
 checkpoint_path = "./checkpoints/train_en2zh"
 data_dump_path = "datasets_en2zh.dat"
 
@@ -58,16 +55,36 @@ def encode_sentence(lang1, lang2, tokenizer_en, tokenizer_zh,
     return lang1, lang2
 
 
-def batchify(data_id_list, batch_size):
+def batchify(data_id_list, max_total_length):
     batch_datas = []
     data_id_list.sort(key=lambda x: (len(x[1]), len(x[0])))
-    for i in tqdm(range(0, len(data_id_list)-batch_size+1, batch_size)):
-        batch_datas.append(data_id_list[i: i+batch_size])
+    current_bs = 0
+    max_len_en = 0
+    max_len_zh = 0
+    current_batch = []
+    for data_ids in data_id_list:
+        current_bs += 1
+        len_en, len_zh = len(data_ids[0]), len(data_ids[1])
+        temp_max_len_en = max(len_en, max_len_en)
+        temp_max_len_zh = max(len_zh, max_len_zh)
+        if (temp_max_len_en + temp_max_len_zh) * current_bs > max_total_length:
+            batch_datas.append(current_batch)
+            max_len_en = len_en
+            max_len_zh = len_zh
+            current_bs = 1
+            current_batch = []
+        else:
+            max_len_en = temp_max_len_en
+            max_len_zh = temp_max_len_zh
+        current_batch.append(data_ids)
+    if current_batch:
+        batch_datas.append(current_batch)
     return batch_datas
 
 
 def read_data():
     if os.path.exists(data_dump_path):
+        LOG("Load data from %s." % data_dump_path)
         return joblib.load(data_dump_path)
     
     tokenizer_zh = tokenization.FullTokenizer("vocabulary/zh_vocab.txt")
@@ -79,6 +96,7 @@ def read_data():
     valid_list = []
     load_file("translation2019zh_valid.json", valid_list)
     LOG(len(valid_list))
+    # load_file("translation2019zh_valid.json", train_list)
     load_file("translation2019zh_train.json", train_list)
     LOG(len(train_list))
     
@@ -89,14 +107,11 @@ def read_data():
                     vocab_size_en, vocab_size_zh) for en, zh in tqdm(train_list, desc="processing traindata")]
     LOG(len(train_id_list))
     
-    train_dataset = batchify(train_id_list, BATCH_SIZE)
-    val_dataset = batchify(valid_id_list, BATCH_SIZE)
-    
     input_vocab_size = vocab_size_en + 2
     target_vocab_size = vocab_size_zh + 2
-    joblib.dump((train_dataset, val_dataset, input_vocab_size,
+    joblib.dump((train_id_list, valid_id_list, input_vocab_size,
                  target_vocab_size), "datasets_en2zh.dat")
-    return train_dataset, val_dataset, input_vocab_size, target_vocab_size
+    return train_id_list, valid_id_list, input_vocab_size, target_vocab_size
 
 
 def batch_to_tensor(batch_data):
@@ -112,17 +127,39 @@ def batch_to_tensor(batch_data):
     return tf.convert_to_tensor(inp, dtype=tf.int32), tf.convert_to_tensor(tar, dtype=tf.int32)
 
 
+def get_tensor_batch(data_list):
+    random.shuffle(data_list)
+    for batch_data in data_list:
+        yield batch_to_tensor(batch_data)
+
+
+def load_embeddings(path):
+    embed_data = joblib.load(path)
+    vocab_size, d_model = embed_data.shape
+    embedings = np.random.random((vocab_size+2, d_model))
+    # embedings[:vocab_size, :] = embed_data
+    return embedings
+
+
 def main():
-    train_dataset, val_dataset, input_vocab_size, target_vocab_size = read_data()
+    train_id_list, valid_id_list, input_vocab_size, target_vocab_size = read_data()
+    LOG("Load data finished, %d training, %d validation" %
+        (len(train_id_list), len(valid_id_list)))
+    train_dataset = batchify(train_id_list, MAX_TOTAL_LENGTH)
+    val_dataset = batchify(valid_id_list, MAX_TOTAL_LENGTH)
+    LOG(" %d batches of training data, %d batches of validation data." %
+        (len(train_dataset), len(val_dataset)))
+    # en_embed_data = load_embeddings("vocabulary/en_embedding.dat")
+    # zh_embed_data = load_embeddings("vocabulary/zh_embedding.dat")
 
     learning_rate = CustomSchedule(d_model)
-    optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98,
-                                         epsilon=1e-9)
+    optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.97, beta_2=0.9999)
     train_loss = tf.keras.metrics.Mean(name='train_loss')
     train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
         name='train_accuracy')
     transformer = Transformer(num_layers, d_model, num_heads, dff,
                               input_vocab_size, target_vocab_size,
+                              # en_embed_data, zh_embed_data,
                               pe_input=input_vocab_size,
                               pe_target=target_vocab_size,
                               rate=dropout_rate)
@@ -157,8 +194,8 @@ def main():
                                          dec_padding_mask)
             loss = loss_function(tar_real, predictions)
             gradients = tape.gradient(loss, transformer.trainable_variables)
-            optimizer.apply_gradients(
-                zip(gradients, transformer.trainable_variables))
+        optimizer.apply_gradients(
+            zip(gradients, transformer.trainable_variables))
 
         train_loss(loss)
         train_accuracy(tar_real, predictions)
@@ -179,7 +216,8 @@ def main():
 
         train_loss(loss)
         train_accuracy(tar_real, predictions)
-
+    LOG("Params batch size:%d, d_model:%d, dff:%d, num_layers:%d, num_heads:%d." %
+        (MAX_TOTAL_LENGTH, d_model, dff, num_layers, num_heads))
     for epoch in range(EPOCHS):
         start = time.time()
 
@@ -187,9 +225,7 @@ def main():
         train_accuracy.reset_states()
 
         # inp -> portuguese, tar -> english
-        random.shuffle(train_dataset)
-        for batch, batch_data in enumerate(train_dataset):
-            inp, tar = batch_to_tensor(batch_data)
+        for batch, (inp, tar) in enumerate(get_tensor_batch(train_dataset)):
             train_step(inp, tar)
 
             if batch % 1000 == 0:
