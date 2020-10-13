@@ -11,11 +11,8 @@ from transformer_tf import Transformer, CustomSchedule, create_masks
 from vocabulary import tokenization
 
 EPOCHS = 30
-# BATCH_SIZE = 64
 MAX_TOTAL_LENGTH = 25000
 num_layers = 4
-d_model = 512
-dff = 512
 num_heads = 8
 dropout_rate = 0.1
 checkpoint_path = "./checkpoints/train_en2zh"
@@ -137,7 +134,7 @@ def load_embeddings(path):
     embed_data = joblib.load(path)
     vocab_size, d_model = embed_data.shape
     embedings = np.random.random((vocab_size+2, d_model))
-    # embedings[:vocab_size, :] = embed_data
+    embedings[:vocab_size, :] = embed_data
     return embedings
 
 
@@ -149,17 +146,18 @@ def main():
     val_dataset = batchify(valid_id_list, MAX_TOTAL_LENGTH)
     LOG(" %d batches of training data, %d batches of validation data." %
         (len(train_dataset), len(val_dataset)))
-    # en_embed_data = load_embeddings("vocabulary/en_embedding.dat")
-    # zh_embed_data = load_embeddings("vocabulary/zh_embedding.dat")
+    en_embed_data = load_embeddings("vocabulary/en_embedding.dat")
+    zh_embed_data = load_embeddings("vocabulary/zh_embedding.dat")
 
+    d_model = dff = zh_embed_data.shape[-1]
     learning_rate = CustomSchedule(d_model)
-    optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.97, beta_2=0.9999)
+    optimizer = tf.keras.optimizers.Adam(learning_rate)
     train_loss = tf.keras.metrics.Mean(name='train_loss')
     train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
         name='train_accuracy')
-    transformer = Transformer(num_layers, d_model, num_heads, dff,
-                              input_vocab_size, target_vocab_size,
-                              # en_embed_data, zh_embed_data,
+    transformer = Transformer(num_layers, num_heads, dff,
+                              # input_vocab_size, target_vocab_size,
+                              en_embed_data, zh_embed_data,
                               pe_input=input_vocab_size,
                               pe_target=target_vocab_size,
                               rate=dropout_rate)
@@ -216,7 +214,7 @@ def main():
 
         train_loss(loss)
         train_accuracy(tar_real, predictions)
-    LOG("Params batch size:%d, d_model:%d, dff:%d, num_layers:%d, num_heads:%d." %
+    LOG("Params MAX_TOTAL_LENGTH:%d, d_model:%d, dff:%d, num_layers:%d, num_heads:%d." %
         (MAX_TOTAL_LENGTH, d_model, dff, num_layers, num_heads))
     for epoch in range(EPOCHS):
         start = time.time()

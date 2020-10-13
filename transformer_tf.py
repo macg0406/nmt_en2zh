@@ -89,6 +89,22 @@ def scaled_dot_product_attention(q, k, v, mask):
     return output, attention_weights
 
 
+class PretrainedEmbedding(tf.keras.layers.Layer):
+    """Non-trainable embedding layer."""
+
+    def __init__(self, embeddings, rate=0.1, **kwargs):
+        """"Instantiate the layer using a pre-defined embedding matrix."""
+        super().__init__(**kwargs)
+        self.embeddings = tf.Variable(embeddings, dtype=tf.float32)
+        # if you want to add some dropout (or normalization, etc.)
+        self.dropout = tf.keras.layers.Dropout(rate=rate)
+
+    def call(self, inputs, training=None):
+        """Embed some input tokens and optionally apply dropout."""
+        output = tf.nn.embedding_lookup(self.embeddings, inputs)
+        return self.dropout(output, training=training)
+
+
 class MultiHeadAttention(tf.keras.layers.Layer):
     def __init__(self, d_model, num_heads):
         super(MultiHeadAttention, self).__init__()
@@ -221,19 +237,19 @@ class DecoderLayer(tf.keras.layers.Layer):
 
 
 class Encoder(tf.keras.layers.Layer):
-    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size,
+    def __init__(self, num_layers, num_heads, dff, input_vocab_embed,
                  maximum_position_encoding, rate=0.1):
         super(Encoder, self).__init__()
 
-        self.d_model = d_model
+        self.d_model = input_vocab_embed.shape[-1]
         self.num_layers = num_layers
 
-        self.embedding = tf.keras.layers.Embedding(input_vocab_size, d_model)
-        self.pos_encoding = positional_encoding(maximum_position_encoding, 64)
-                                                # self.d_model)
-        self.pos_merge = tf.keras.layers.Dense(d_model);
-
-        self.enc_layers = [EncoderLayer(d_model, num_heads, dff, rate)
+        # self.embedding = tf.keras.layers.Embedding(input_vocab_size, d_model)
+        self.embedding = PretrainedEmbedding(input_vocab_embed, rate)
+        self.pos_encoding = positional_encoding(maximum_position_encoding,
+                                                self.d_model)
+        self.norm_layer = tf.keras.layers.LayerNormalization();
+        self.enc_layers = [EncoderLayer(self.d_model, num_heads, dff, rate)
                            for _ in range(num_layers)]
 
         self.dropout = tf.keras.layers.Dropout(rate)
@@ -242,10 +258,9 @@ class Encoder(tf.keras.layers.Layer):
         batch_size, seq_len = tf.shape(x)[0], tf.shape(x)[1]
         # 将嵌入和位置编码相加。
         x = self.embedding(x)  # (batch_size, input_seq_len, d_model)
-        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        pos_enc = tf.tile(self.pos_encoding, [batch_size, 1, 1])
-        x = self.pos_merge(tf.concat([x, pos_enc[:, :seq_len, :]], axis=2))
-        # x += self.pos_encoding[:, :seq_len, :]
+        x *= 10
+        x += self.pos_encoding[:, :seq_len, :]
+        x = self.norm_layer(x)
         x = self.dropout(x, training=training)
         for i in range(self.num_layers):
             x = self.enc_layers[i](x, training, mask)
@@ -253,18 +268,19 @@ class Encoder(tf.keras.layers.Layer):
 
 
 class Decoder(tf.keras.layers.Layer):
-    def __init__(self, num_layers, d_model, num_heads, dff, target_vocab_size,
+    def __init__(self, num_layers, num_heads, dff, target_vocab_embed,
                  maximum_position_encoding, rate=0.1):
         super(Decoder, self).__init__()
-        self.d_model = d_model
+        self.d_model = target_vocab_embed.shape[-1]
         self.num_layers = num_layers
 
-        self.embedding = tf.keras.layers.Embedding(target_vocab_size, d_model)
+        # self.embedding = tf.keras.layers.Embedding(target_vocab_size, d_model)
+        self.embedding = PretrainedEmbedding(target_vocab_embed, rate)
         self.pos_encoding = positional_encoding(
-            maximum_position_encoding, 64)  # d_model)
-        self.dec_layers = [DecoderLayer(d_model, num_heads, dff, rate)
+            maximum_position_encoding, self.d_model)
+        self.norm_layer = tf.keras.layers.LayerNormalization();
+        self.dec_layers = [DecoderLayer(self.d_model, num_heads, dff, rate)
                            for _ in range(num_layers)]
-        self.pos_merge = tf.keras.layers.Dense(d_model)
         self.dropout = tf.keras.layers.Dropout(rate)
 
     def call(self, x, enc_output, training,
@@ -272,10 +288,9 @@ class Decoder(tf.keras.layers.Layer):
         batch_size, seq_len = tf.shape(x)[0], tf.shape(x)[1]
         attention_weights = {}
         x = self.embedding(x)  # (batch_size, target_seq_len, d_model)
-        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        pos_enc = tf.tile(self.pos_encoding, [batch_size, 1, 1])
-        x = self.pos_merge(tf.concat([x, pos_enc[:, :seq_len, :]], axis=2))
-        # x += self.pos_encoding[:, :seq_len, :]
+        x *= 10
+        x += self.pos_encoding[:, :seq_len, :]
+        x = self.norm_layer(x)
         x = self.dropout(x, training=training)
 
         for i in range(self.num_layers):
@@ -288,13 +303,15 @@ class Decoder(tf.keras.layers.Layer):
 
 
 class Transformer(tf.keras.Model):
-    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size,
-                 target_vocab_size, pe_input, pe_target, rate=0.1):
+    def __init__(self, num_layers, num_heads, dff, input_vocab_embed,
+                 target_vocab_embed, pe_input, pe_target, rate=0.1):
         super(Transformer, self).__init__()
-        self.encoder = Encoder(num_layers, d_model, num_heads, dff,
-                               input_vocab_size, pe_input, rate)
-        self.decoder = Decoder(num_layers, d_model, num_heads, dff,
-                               target_vocab_size, pe_target, rate)
+        input_vocab_size, d_model = input_vocab_embed.shape
+        target_vocab_size = target_vocab_embed.shape[0]
+        self.encoder = Encoder(num_layers, num_heads, dff,
+                               input_vocab_embed, pe_input, rate)
+        self.decoder = Decoder(num_layers, num_heads, dff,
+                               target_vocab_embed, pe_target, rate)
         self.final_layer = tf.keras.layers.Dense(target_vocab_size)
 
     def call(self, inp, tar, training, enc_padding_mask,
